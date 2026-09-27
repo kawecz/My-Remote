@@ -6,8 +6,8 @@ import '../core/wake_on_lan_service.dart';
 import '../models/tv_device.dart';
 import '../widgets/dpad.dart';
 import '../widgets/volume_channel_rocker.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class RemoteScreen extends StatefulWidget {
   const RemoteScreen({super.key});
@@ -30,17 +30,17 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   Future<void> _init() async {
-  final saved = await _service.loadSavedDevice();
+    final saved = await _service.loadSavedDevice();
 
-  // Fallback values come from .env (gitignored).
-  final defaultIp = dotenv.env['TV_DEFAULT_IP'] ?? '';
-  final defaultMac = dotenv.env['TV_DEFAULT_MAC'];
-  final defaultName = dotenv.env['TV_DEFAULT_NAME'] ?? 'TV';
+    // Fallback values come from .env (gitignored).
+    final defaultIp = dotenv.env['TV_DEFAULT_IP'] ?? '';
+    final defaultMac = dotenv.env['TV_DEFAULT_MAC'];
+    final defaultName = dotenv.env['TV_DEFAULT_NAME'] ?? 'TV';
 
-  _device = saved ??
-      TvDevice(ip: defaultIp, name: defaultName, mac: defaultMac);
-  _connect();
-}
+    _device =
+        saved ?? TvDevice(ip: defaultIp, name: defaultName, mac: defaultMac);
+    _connect();
+  }
 
   Future<void> _connect() async {
     final d = _device!;
@@ -55,32 +55,32 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   Future<void> _powerPressed() async {
-  // If we're already connected, just send the power key.
-  if (_state == TvConnectionState.connected) {
-    _service.sendKey(TvKey.power);
-    return;
-  }
-
-  // Otherwise, try to wake the TV.
-  if (_device?.mac == null) return;
-
-  debugPrint('[APP] Sending Wake-on-LAN to ${_device!.mac}');
-  await WakeOnLanService.wake(_device!.mac!);
-
-  // Retry connecting for up to ~30 seconds.
-  for (int attempt = 0; attempt < 10; attempt++) {
-    await Future.delayed(const Duration(seconds: 3));
-    debugPrint('[APP] Connect attempt ${attempt + 1}/10');
-    await _connect();
-
+    // If we're already connected, just send the power key.
     if (_state == TvConnectionState.connected) {
-      debugPrint('[APP] TV is up after ${(attempt + 1) * 3}s');
+      _service.sendKey(TvKey.power);
       return;
     }
-  }
 
-  debugPrint('[APP] Gave up after 30s — TV did not respond to WoL');
-}
+    // Otherwise, try to wake the TV.
+    if (_device?.mac == null) return;
+
+    debugPrint('[APP] Sending Wake-on-LAN to ${_device!.mac}');
+    await WakeOnLanService.wake(_device!.mac!);
+
+    // Retry connecting for up to ~30 seconds.
+    for (int attempt = 0; attempt < 10; attempt++) {
+      await Future.delayed(const Duration(seconds: 3));
+      debugPrint('[APP] Connect attempt ${attempt + 1}/10');
+      await _connect();
+
+      if (_state == TvConnectionState.connected) {
+        debugPrint('[APP] TV is up after ${(attempt + 1) * 3}s');
+        return;
+      }
+    }
+
+    debugPrint('[APP] Gave up after 30s — TV did not respond to WoL');
+  }
 
   void _sendText() async {
     final text = _textController.text.trim();
