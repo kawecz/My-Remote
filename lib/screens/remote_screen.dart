@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import '../core/tv_connection_service.dart';
 import '../core/tv_key_codes.dart';
@@ -6,8 +7,6 @@ import '../core/wake_on_lan_service.dart';
 import '../models/tv_device.dart';
 import '../widgets/dpad.dart';
 import '../widgets/volume_channel_rocker.dart';
-
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class RemoteScreen extends StatefulWidget {
   const RemoteScreen({super.key});
@@ -21,18 +20,20 @@ class _RemoteScreenState extends State<RemoteScreen> {
   final _textController = TextEditingController();
   TvConnectionState _state = TvConnectionState.disconnected;
   TvDevice? _device;
+  bool _busy = false;
 
   @override
   void initState() {
     super.initState();
-    _service.stateStream.listen((s) => setState(() => _state = s));
+    _service.stateStream.listen((s) {
+      if (mounted) setState(() => _state = s);
+    });
     _init();
   }
 
   Future<void> _init() async {
     final saved = await _service.loadSavedDevice();
 
-    // Fallback values come from .env (gitignored).
     final defaultIp = dotenv.env['TV_DEFAULT_IP'] ?? '';
     final defaultMac = dotenv.env['TV_DEFAULT_MAC'];
     final defaultName = dotenv.env['TV_DEFAULT_NAME'] ?? 'TV';
@@ -43,43 +44,40 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   Future<void> _connect() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+
     final d = _device!;
     try {
-      await _service.connect(
-        ip: d.ip,
+      await _service.connectWithDiscovery(
+        initialIp: d.ip,
         name: d.name,
         mac: d.mac,
         token: d.token,
       );
-    } catch (_) {}
+      if (_service.device != null) {
+        _device = _service.device;
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _powerPressed() async {
-    // If we're already connected, just send the power key.
+    // Already connected? Just toggle power.
     if (_state == TvConnectionState.connected) {
       _service.sendKey(TvKey.power);
       return;
     }
 
-    // Otherwise, try to wake the TV.
     if (_device?.mac == null) return;
 
     debugPrint('[APP] Sending Wake-on-LAN to ${_device!.mac}');
     await WakeOnLanService.wake(_device!.mac!);
 
-    // Retry connecting for up to ~30 seconds.
-    for (int attempt = 0; attempt < 10; attempt++) {
-      await Future.delayed(const Duration(seconds: 3));
-      debugPrint('[APP] Connect attempt ${attempt + 1}/10');
-      await _connect();
-
-      if (_state == TvConnectionState.connected) {
-        debugPrint('[APP] TV is up after ${(attempt + 1) * 3}s');
-        return;
-      }
-    }
-
-    debugPrint('[APP] Gave up after 30s — TV did not respond to WoL');
+    // Wait a few seconds for the TV to boot, then try once.
+    await Future.delayed(const Duration(seconds: 5));
+    await _connect();
   }
 
   void _sendText() async {
@@ -207,7 +205,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
           decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         Text(label, style: TextStyle(color: Colors.grey[400], fontSize: 14)),
-        if (_state == TvConnectionState.error) ...[
+        if (_state == TvConnectionState.error && !_busy) ...[
           const SizedBox(width: 12),
           TextButton(
             onPressed: _connect,

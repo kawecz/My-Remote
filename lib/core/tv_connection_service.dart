@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/io.dart';
 
 import '../models/tv_device.dart';
+import 'tv_discovery_service.dart';
 
 enum TvConnectionState {
   disconnected,
@@ -16,9 +17,6 @@ enum TvConnectionState {
   error,
 }
 
-/// Handles the WebSocket connection to a Samsung Tizen TV, the one-time
-/// pairing handshake, token persistence, and sending remote-key / text
-/// commands.
 class TvConnectionService {
   static const _prefsIpKey = 'tv_ip';
   static const _prefsNameKey = 'tv_name';
@@ -26,7 +24,7 @@ class TvConnectionService {
   static const _prefsTokenKey = 'tv_token';
 
   static const _appName = 'myremote';
-  static const _port = 8002; // TLS port used by 2018+ Tizen TVs
+  static const _port = 8002;
 
   IOWebSocketChannel? _channel;
   StreamSubscription? _subscription;
@@ -38,14 +36,16 @@ class TvConnectionService {
   TvConnectionState _state = TvConnectionState.disconnected;
   TvConnectionState get state => _state;
 
+  /// Guards against concurrent connect() calls. If a connect is already
+  /// in flight, the second call is a no-op.
+  bool _connecting = false;
+
   void _setState(TvConnectionState s) {
     debugPrint('[TV] state: $_state -> $s');
     _state = s;
     _stateController.add(s);
   }
 
-  /// Loads a previously paired device (ip/name/mac/token) from local storage.
-  /// Returns null if none was saved yet.
   Future<TvDevice?> loadSavedDevice() async {
     final prefs = await SharedPreferences.getInstance();
     final ip = prefs.getString(_prefsIpKey);
@@ -64,53 +64,134 @@ class TvConnectionService {
     await prefs.setString(_prefsNameKey, d.name);
     if (d.mac != null) await prefs.setString(_prefsMacKey, d.mac!);
     if (d.token != null) await prefs.setString(_prefsTokenKey, d.token!);
+    debugPrint(
+      '[TV] Saved device: ip=${d.ip}, name=${d.name}, '
+      'mac=${d.mac}, token=${d.token}',
+    );
   }
 
-  /// Connects (or reconnects) to the TV at [ip]. If a [token] is already
-  /// known, it's sent along so the TV skips the on-screen pairing prompt.
-  /// On first-ever connection, accept the prompt on the TV itself; the
-  /// token arriving in the `ms.channel.connect` event is then persisted.
+  /// Cleans up any previous socket. Called before opening a new one and
+  /// whenever a connection is considered dead.
+  Future<void> _cleanupSocket() async {
+    try {
+      await _subscription?.cancel();
+    } catch (_) {}
+    try {
+      await _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
+    _subscription = null;
+  }
+
+  /// Connects to the TV at [ip]. Always tears down the previous socket
+  /// first, so we never accumulate zombie connections on the TV side.
   Future<void> connect({
     required String ip,
     String name = 'TV',
     String? mac,
     String? token,
   }) async {
-    _setState(TvConnectionState.connecting);
-    device = TvDevice(ip: ip, name: name, mac: mac, token: token);
-
-    final encodedName = base64Encode(utf8.encode(_appName));
-    final tokenParam = (token != null && token.isNotEmpty)
-        ? '&token=$token'
-        : '';
-    final uri = Uri.parse(
-      'wss://$ip:$_port/api/v2/channels/samsung.remote.control'
-      '?name=$encodedName$tokenParam',
-    );
-
-    // Samsung TVs use a self-signed certificate on the control port, so a
-    // plain WebSocket.connect fails TLS verification. We accept it here
-    // because we're talking to a device we already trust on the local
-    // network.
-    final client = HttpClient()
-      ..badCertificateCallback = (cert, host, port) => true;
+    if (_connecting) {
+      debugPrint('[TV] connect() ignored — already connecting');
+      return;
+    }
+    _connecting = true;
 
     try {
+      await _cleanupSocket();
+      _setState(TvConnectionState.connecting);
+      device = TvDevice(ip: ip, name: name, mac: mac, token: token);
+
+      final encodedName = base64Encode(utf8.encode(_appName));
+      final tokenParam = (token != null && token.isNotEmpty)
+          ? '&token=$token'
+          : '';
+      final uri = Uri.parse(
+        'wss://$ip:$_port/api/v2/channels/samsung.remote.control'
+        '?name=$encodedName$tokenParam',
+      );
+
+      final client = HttpClient()
+        ..badCertificateCallback = (cert, host, port) => true;
+
+      debugPrint('[TV] Connecting to: $uri');
       final socket = await WebSocket.connect(
         uri.toString(),
         customClient: client,
-      ).timeout(const Duration(seconds: 8));
+      ).timeout(const Duration(seconds: 10));
+
       _channel = IOWebSocketChannel(socket);
       _setState(TvConnectionState.awaitingPairing);
 
       _subscription = _channel!.stream.listen(
         _handleMessage,
-        onError: (_) => _setState(TvConnectionState.error),
-        onDone: () => _setState(TvConnectionState.disconnected),
+        onError: (e) {
+          debugPrint('[TV] stream error: $e');
+          _setState(TvConnectionState.error);
+        },
+        onDone: () {
+          debugPrint('[TV] stream closed by TV');
+          _setState(TvConnectionState.disconnected);
+        },
       );
-    } catch (e) {
+    } catch (e, stack) {
+      debugPrint('[TV] CONNECT FAILED: $e');
       _setState(TvConnectionState.error);
       rethrow;
+    } finally {
+      _connecting = false;
+    }
+  }
+
+  Future<bool> connectWithDiscovery({
+    required String initialIp,
+    required String name,
+    String? mac,
+    String? token,
+    Duration discoveryTimeout = const Duration(seconds: 3),
+  }) async {
+    // Attempt 1: saved IP
+    try {
+      await connect(ip: initialIp, name: name, mac: mac, token: token);
+      return true;
+    } catch (e) {
+      debugPrint('[TV] Initial connect to $initialIp failed: $e');
+    }
+
+    // Attempt 2: SSDP discovery
+    debugPrint('[TV] Running SSDP discovery...');
+    _setState(TvConnectionState.connecting);
+
+    final discoveredIp = await TvDiscoveryService.discoverTv(
+      timeout: discoveryTimeout,
+    );
+
+    if (discoveredIp == null) {
+      debugPrint('[TV] Discovery found nothing');
+      _setState(TvConnectionState.error);
+      return false;
+    }
+
+    if (discoveredIp == initialIp) {
+      debugPrint(
+        '[TV] Discovery returned the same IP ($discoveredIp) — '
+        'giving up',
+      );
+      _setState(TvConnectionState.error);
+      return false;
+    }
+
+    debugPrint('[TV] Discovery found TV at $discoveredIp — retrying');
+    try {
+      await connect(ip: discoveredIp, name: name, mac: mac, token: token);
+      if (device != null) {
+        await _saveDevice(device!);
+      }
+      return true;
+    } catch (e) {
+      debugPrint('[TV] Connect to discovered IP $discoveredIp failed: $e');
+      _setState(TvConnectionState.error);
+      return false;
     }
   }
 
@@ -124,17 +205,23 @@ class TvConnectionService {
       if (newToken != null && device != null) {
         device = device!.copyWith(token: newToken);
         _saveDevice(device!);
+        debugPrint('[TV] Saved new token: $newToken');
+      } else {
+        debugPrint(
+          '[TV] No new token in payload, using existing: '
+          '${device?.token}',
+        );
       }
       _setState(TvConnectionState.connected);
     } else if (event == 'ms.channel.timeOut' ||
         event == 'ms.channel.unauthorized') {
+      debugPrint('[TV] TV rejected/expired the pairing ($event)');
       _setState(TvConnectionState.error);
+      // Tear down the dead socket so the next connect starts fresh.
+      _cleanupSocket();
     }
-    // Other events (ms.remote.touchEnable, ms.error, etc.) can be handled
-    // here as needed.
   }
 
-  /// Sends a single remote-control key press, e.g. TvKey.volumeUp.
   void sendKey(String keyCode) {
     if (_channel == null || _state != TvConnectionState.connected) {
       debugPrint(
@@ -156,22 +243,6 @@ class TvConnectionService {
     );
   }
 
-  /// Types [text] into whatever input field is currently focused/active on
-  /// the TV's own screen (e.g. a search box the user has already tapped
-  /// into). It does NOT open a keyboard by itself — there has to be a text
-  /// field already active on the TV side, same as a physical remote's
-  /// virtual keyboard input would require.
-  ///
-  /// Returns false without sending anything if there's no live connection,
-  /// so the UI can tell the user instead of failing silently.
-  /// Types [text] into whatever input field is currently focused/active on
-  /// the TV's own screen (e.g. a search box the user has already tapped
-  /// into). It does NOT open a keyboard by itself — there has to be a text
-  /// field already active on the TV side, same as a physical remote's
-  /// virtual keyboard input would require.
-  ///
-  /// Returns false without sending anything if there's no live connection,
-  /// so the UI can tell the user instead of failing silently.
   bool sendText(String text) {
     if (_channel == null || _state != TvConnectionState.connected) {
       debugPrint(
@@ -180,8 +251,6 @@ class TvConnectionService {
       return false;
     }
 
-    // A API da Samsung espera o texto puro, NÃO em base64.
-    // O comando é sempre "sendText" e o TypeOfRemote é "SendInputString".
     final payload = jsonEncode({
       'method': 'ms.remote.control',
       'params': {
@@ -196,10 +265,35 @@ class TvConnectionService {
     return true;
   }
 
+  /// Launches an installed app on the TV by its numeric App ID.
+  ///
+  /// Samsung TVs silently ignore unknown IDs — if the app doesn't open,
+  /// the ID is wrong for this TV/region. There's no error returned.
+  ///
+  /// Returns false only if we're not connected or the ID is empty.
+  bool launchApp(String appId) {
+    if (_channel == null || _state != TvConnectionState.connected) {
+      debugPrint('[TV] launchApp($appId) skipped — not connected');
+      return false;
+    }
+    if (appId.isEmpty) return false;
+
+    final payload = jsonEncode({
+      'method': 'ms.channel.emit',
+      'params': {
+        'event': 'ed.apps.launch',
+        'to': 'host',
+        'data': {'appId': appId, 'action_type': 'DEEP_LINK'},
+      },
+    });
+
+    debugPrint('[TV] -> launchApp($appId) | $payload');
+    _channel!.sink.add(payload);
+    return true;
+  }
+
   Future<void> disconnect() async {
-    await _subscription?.cancel();
-    await _channel?.sink.close();
-    _channel = null;
+    await _cleanupSocket();
     _setState(TvConnectionState.disconnected);
   }
 
